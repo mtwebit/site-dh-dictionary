@@ -1,0 +1,780 @@
+<?php namespace ProcessWire;
+// DEBUG disable file compiler for this file
+// TODO remove these lines
+// FileCompiler=0
+
+/**
+ * ProcessWire 'DictionarySupport' module
+ *
+ * The module provides support functions to import and display dictionaries.
+ * See https://github.com/mtwebit/DictionarySupport for more details.
+ */
+
+/**
+ * Abstract class Process extends WireData implements Module.
+ */
+class DictionarySupport extends Process implements Module {
+  /**
+   * Constants and global properties
+   *
+   */
+  // options DB table name
+  const TABLE_NAME = 'dictionarysupport';
+  // DB schema version, increase this if new options are added
+  const SCHEMA_VERSION = 1;
+  // these options present in the DB and can be altered on a page
+  const OPT_DRYRUN = 1; // do not do anything just pretend
+  const OPT_PURGE = 2; // purge the dictionary before executing a job
+  // these are hidden option IDs
+  const OPT_HIDDEN = 20; // start ID for hidden options
+  const OPT_SKIP = 21; // skip the specified number of records
+  const OPT_MAX_TIME = 22; // max execution time
+  // options that go into the database
+  const OPTIONS = array(
+    self::OPT_DRYRUN  => 'Do not actually import/update/delete anything',
+    self::OPT_PURGE  => 'Purge the dictionary before import',
+    self::OPT_SKIP  => 'Skip some records while processing a dictionary',
+    self::OPT_MAX_TIME  => 'Maximum execution time',
+  );
+  // default options
+  const DEF_OPTIONS = array(
+    self::OPT_DRYRUN => false,
+    self::OPT_PURGE  => false,
+  );
+  // output field names / not used atm
+  // private $fieldNames;
+  // the base URL of the module's admin page
+  public $adminUrl;
+  // redirect URL after page save
+  private $redirectUrl;
+  // time threshold before the max_execution_time [sec]
+  const MAX_EXEC_TIME_THRESHOLD = 55; // TODO lower to increase max. exec time
+  // max execution time for async requests [sec]
+  const MAX_ASYNC_EXEC_TIME = 20; // seconds
+  // file tags
+  const TAG_IMPORT='import';
+  const TAG_UPDATE='update';
+  const TAG_DELETE='delete';
+  // default initial letters for navigation trees
+  public $dictInitialLetters = array(
+    'a' => 'A, Á',
+    'b' => 'B',
+    'c' => 'C',
+    'cs' => 'Cs',
+    'd' => 'D',
+    'dzs' => 'Dzs',
+    'e' => 'E, É',
+    'f' => 'F',
+    'g' => 'G',
+    'gy' => 'Gy',
+    'h' => 'H',
+    'i' => 'I, Í',
+    'j' => 'J',
+    'k' => 'K',
+    'l' => 'L',
+    'm' => 'M',
+    'n' => 'N',
+    'ny' => 'Ny',
+    'o' => 'O, Ó',
+    'ö' => 'Ö, Ő',
+    'p' => 'P',
+    'q' => 'Q',
+    'r' => 'R',
+    's' => 'S',
+    'sz' => 'Sz',
+    't' => 'T',
+    'ty' => 'Ty',
+    'u' => 'U, Ú',
+    'ü' => 'Ü, Ű',
+    'v' => 'V',
+    'z' => 'Z',
+    'zs' => 'Zs',
+    '-' => '-',
+    '*' => '*',
+    '$' => '$',
+    '+' => '+',
+  );
+  
+
+/***********************************************************************
+ * MODULE SETUP
+ **********************************************************************/
+
+  /**
+   * Called only when this module is installed
+   * 
+   * Creates new custom database table for storing import configuration data.
+   */
+  public function ___install() {
+    parent::___install(); // creates the admin page
+    // create and populate the configuration options table in the database
+    // this table is used by the "Select external option" fieldtype
+    $sql = 'CREATE TABLE '.self::TABLE_NAME." (
+            option_key INT UNSIGNED NOT NULL DEFAULT 0,
+            option_value TEXT DEFAULT NULL,
+            comment TEXT DEFAULT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+        INSERT INTO ".self::TABLE_NAME." (option_key, option_value) VALUES ";
+    foreach (self::OPTIONS as $key => $value) {
+      if ($key >= self::OPT_HIDDEN) break; // do not process hidden options
+      $sql .= "($key, '$value'), ";
+    }
+    $sql = rtrim($sql, ', ');
+    $this->message('Creating database table '.self::TABLE_NAME.'.', Notice::debug);
+//    $this->message($sql, Notice::debug);
+    $this->database->exec($sql);
+  }
+
+
+  /**
+   * Called only when this module is uninstalled
+   * 
+   * Drops database table created during installation.
+   */
+  public function ___uninstall() {
+    parent::___uninstall(); // deletes the admin page
+    $this->message('Deleting database table '.self::TABLE_NAME);
+    $this->database->exec('DROP TABLE IF EXISTS '.self::TABLE_NAME);
+  }
+
+
+  /**
+   * Initialization
+   * 
+   * This function attaches a hook for page save and decodes module options.
+   */
+  public function init() {
+    parent::init();
+
+    // check requirements
+    if (!$this->modules->isInstalled("FieldtypeSelectExtOption")
+        || !class_exists('XMLReader')) {
+      return;
+    }
+
+    // set default URLs
+    $this->adminUrl = wire('config')->urls->admin.'page/dict-manage/';
+    $this->redirectUrl = '';
+
+/* field mappings are not used atm
+    // process module's configuration: field name mappings
+    $this->fieldNames = json_decode(trim($this->fieldmappings), true);
+    if (!is_array($this->fieldNames)) {
+      $this->error("Invalid field name mappings. Check the module's configuration.");
+      return;
+    }
+*/
+
+    // install a conditional hook after page save to import dictionary entries
+    // TODO this conditional hook would be better but it does not work:
+    //   'Pages(template='.$this->dictionary_template.')::saveReady'
+    $this->pages->addHookAfter('Pages::saveReady', $this, 'processDictionary');
+  }
+
+
+/***********************************************************************
+ * HOOKS
+ **********************************************************************/
+
+  /**
+   * Hook that creates a dictionary job to process the input files
+   */
+  public function processDictionary(HookEvent $event) {
+    $page = $event->arguments[0];
+    // check the template
+    // TODO would be better not to call the hook at all
+    if ($page->template != $this->dictionary_template) return;
+    
+    // create a dictionary object from the page using this module as an environment
+    require_once __DIR__.'/Dictionary.php';
+    $dict = new Dictionary($page, $this);
+
+    // add the necessary jobs to the dictionary
+    if ($dict->addJobsOnPageSave()) { // if jobs have been added
+      // set up a redirect to execute jobs after page save
+      $this->redirectUrl = $this->adminUrl.'batch/'.$page->id;
+      // add a temporary hook to redirect to the job executor page after saving the current page
+      $this->pages->addHookBefore('ProcessPageEdit::processSaveRedirect', $this, 'processDictionaryJobs');
+    }
+  }
+
+
+  /**
+   * Hook that redirects the user to the dict admin page
+   */
+  public function processDictionaryJobs(HookEvent $event) {
+    if ($this->redirectUrl != '') {
+      // redirect on page save
+      $event->arguments = array($this->redirectUrl);
+      $this->redirectUrl = '';
+    }
+    // redirect is done or not needed, remove this hook
+    $event->removeHook(null);
+  }
+
+
+/***********************************************************************
+ * Process module endpoints
+ * Module routing:
+ *     admin page - loc: / - execute() - displays all dictionaries and their jobs
+ *     job exec   - loc: /job/$dictPageId[/$jobEntry] - executeJob() - execute a job
+ *     batch exec - loc: /batch/$dictPageId[/$jobEntry] - executeBatch() - execute a job in batch mode
+ *     JSON API   - loc: /api/$dictPageId[/$command] - executeApi() - execute an api call or job and return a JSON object
+ *    
+ * More info about routing:
+ * https://processwire.com/talk/topic/7832-module-routing-executesomething-versus-this-input-urlsegment1-in-process-modules/
+ **********************************************************************/
+  /**
+   * Execute the main function for the admin menu interface
+   * 
+   */
+  public function execute() {
+    $out = '<h2>Dictionary Admin page</h2>';
+
+    $out .= '<h3>Dictionaries</h3><p>';
+    $dictPages = $this->pages->find('template='.$this->dictionary_template);
+    if (!count($dictPages)) {
+      $out .= 'None found.';
+    } else foreach ($dictPages as $dictPage) {
+      // $out .= '<div id="dictEntry"dictId="'.$dictPage->id.'" adminUrl="'.$this->adminUrl.'" timeout="'.(1000*intval(ini_get('max_execution_time'))).'">';
+      $out .= '<a href="'.$dictPage->url.'">'.$dictPage->title.'</a> ';
+      $out .= ' ('.$dictPage->numChildren('template='.$this->headword_template)." headwords), ";
+      // if the above is slow, we can call a javascript job to count the pages
+      // $out .= '(<i>Javascript is needed to count headwords.</i>)';
+      if ($dictPage->editable()) {
+        $out .= ' [<a href="'.$dictPage->editUrl().'">Edit</a>]';
+        require_once __DIR__.'/DictionaryJob.php';
+        $out .= ' [<a href="'.$this->adminUrl.'job/'.$dictPage->id.'/'.DictionaryJob::CMD_PURGE.'">Purge!!</a>]';
+      }
+      // $out .= '</div>';
+    }
+    $out .= "</p>\n";
+
+    $out .= '<h3>Pending jobs</h3><p>';
+    $jobsets = $this->findJobs($dictPages);
+    if (!count($jobsets)) {
+      $out .= 'None found.';
+    } else foreach ($jobsets as $pageId => $pageJobs) foreach ($pageJobs as $jobEntry) {
+      if (!strlen(trim($jobEntry))) continue;
+      require_once __DIR__.'/DictionaryJob.php';
+      list ($job, $command, $arguments, $description) = DictionaryJob::deconstructJobEntry($jobEntry);
+      if ($command === DictionaryJob::CMD_DONE) continue; // skip finished jobs
+      $out .= $this->pages->get($pageId)->title.': '.$description;
+      $out .= ' [<a href="'.$this->adminUrl.'job/'.$pageId.'/'.urlencode($job).'">Execute in the foreground</a>] '; // TODO check permission
+      $out .= ' [<a href="'.$this->adminUrl.'batch/'.$pageId.'/'.urlencode($job).'" target="_blank">Execute in the background</a>]<br />'; // TODO check permission
+    }
+    $out .= "</p>\n";
+
+    $out .= '<p><a href="'.$this->page->url.'">Refresh this page.</a></p>';
+    return $out;
+  }
+
+
+  /**
+   * Execute a job in the foreground
+   * URI structure: .... job/dictPageId[/jobEntry]
+   * 
+   */
+  public function executeJob() {
+    // analyze the request
+    list ($num, $command, $dictPageId, $jobEntry, $params) =
+      $this->getRequestFields($_SERVER['REQUEST_URI']);
+
+    if ($num < 2 || !is_numeric($dictPageId) ) { // too few or invalid arguments
+      $this->error('Invalid arguments found in the request: '.$_SERVER['REQUEST_URI']);
+      return $this->execute();
+    }
+
+    $dictPage = $this->pages->findOne('id='.$dictPageId.',template='.$this->dictionary_template);
+    if ($dictPage instanceof NullPage) {
+      $this->error('Dictionary not found.');
+      return $this->execute();
+    }
+
+    require_once __DIR__.'/Dictionary.php';
+    $dict = new Dictionary($dictPage, $this);
+
+    return $dict->executeJob($jobEntry, true) . $this->execute();
+  }
+
+
+  /**
+   * Execute a long job using frontend JS calls to the backend API
+   * URI structure: .... batch/dictPageId[/jobEntry]
+   */
+  public function executeBatch() {
+    // analyze the request
+    list ($num, $command, $dictPageId, $jobEntry, $params) =
+      $this->getRequestFields($_SERVER['REQUEST_URI']);
+
+    if ($num < 2 || !is_numeric($dictPageId) ) { // too few or invalid arguments
+      $this->error('Invalid arguments found in the request.');
+      return $this->execute();
+    }
+
+    // turn off debugging since this thread is only the frame for executing jobs via javascript
+    $this->config->debug = false;
+
+    $dictPage = $this->pages->findOne('id='.$dictPageId.',template='.$this->dictionary_template);
+    if ($dictPage instanceof NullPage) {
+      return 'Dictionary not found.';
+    }
+
+    require_once __DIR__.'/Dictionary.php';
+    $dict = new Dictionary($dictPage, $this);
+
+    if (!$dict->hasJob($jobEntry, 0)) {
+      return 'Job not found.';
+    }
+
+    require_once __DIR__.'/DictionaryJob.php';
+    $job = new DictionaryJob($dict, $jobEntry);
+
+    $out = '<h2 id="jobtitle">Executing job: '.$job->description
+          .' <a href="'.$this->adminUrl.'">Cancel</a></h2>';
+    // setting up a div field for javascript output
+    // apiurl points to this module's api endpoint with dict-id and jobentry arguments
+    // timeout specifies the timeout in ms after which the JS routine will signal an error
+    $out .= '
+<div id="jobprogress"
+     dictId="'.$dictPage->id.'"
+     jobEntry="'.urlencode($job->job).'"
+     adminUrl="'.$this->adminUrl.'"
+     timeout="'.(1000*intval(ini_get('max_execution_time'))).'">
+  <div class="progress-label"></div>
+</div>
+<div id="joblog">Javascript is not enabled. Background jobs will not execute.</div>';
+    return $out;
+    // the job will be executed by Javascript functions
+  }
+
+
+  /**
+   * Public admin API functions over HTTP (/api)
+   */
+  public function executeApi() {
+    // response object (will be encoded in JSON form)
+    $ret = array(
+      'status'=> false,
+      'result' => '',
+      'value' => 0,
+      'log' => '',
+      'nextjob' => '',
+      'debug' => $this->config->debug
+      );
+
+    // analyze the request
+    list ($num, $command, $dictPageId, $jobEntry, $params) =
+      $this->getRequestFields($_SERVER['REQUEST_URI']);
+
+    if ($num < 2 || !is_numeric($dictPageId) ) { // too few or invalid arguments
+      $ret['result'] = 'Invalid API request: '.$_SERVER['REQUEST_URI'];
+      $ret['log'] = $this->getNotices();
+      echo json_encode($ret);
+      exit;
+    }
+
+    // select the matching dictionary
+    $dictPage = $this->pages->findOne('id='.$dictPageId.',template='.$this->dictionary_template);
+    if ($dictPage instanceof NullPage) {
+      $ret['result'] = 'No matching dictionary found.';
+      $ret['log'] = $this->getNotices();
+      echo json_encode($ret);
+      exit;
+    }
+
+    // construct a dictionary object
+    require_once __DIR__.'/Dictionary.php';
+    $dict = new Dictionary($dictPage, $this);
+
+    if (isset($params['est'])) { // an estimation is requested for a job
+      if (false===($res = $dict->estimateJob($jobEntry, false))) {
+        $ret['result'] = 'Job estimation failed.';
+      } else {
+        $ret['value'] = $res;
+        $ret['status'] = true;
+      }
+      $ret['log'] = $this->getNotices();
+      echo json_encode($ret);
+      exit;
+    }
+
+    // use a short execution time to present results to the user more often
+    $dict->setOption(self::OPT_MAX_TIME, time() + self::MAX_ASYNC_EXEC_TIME);
+
+    // execute the job and get the results
+    if (false===($res = $dict->executeJob($jobEntry, false))) {
+      $ret['result'] = 'Job execution failed.';
+    } else {
+      $ret['status'] = true;
+      $ret['result'] = $res;
+      $ret['value'] = $dict->getNumberOfProcessedRecords();
+      $ret['nextjob'] = ($dict->hasJob('', 0) ? urlencode($dict->findJobs('', 0)[0]) : '');
+    }
+    $ret['log'] = $this->getNotices();
+    echo json_encode($ret);
+    exit; // stop executing the script so don't output anything else
+  }
+
+
+/***********************************************************************
+ * CONTENT MANAGEMENT
+ **********************************************************************/
+  /**
+   * Create and save a new Processwire Page and set its fields.
+   * 
+   * @param $parent the parent node reference
+   * @param $template the template of the new page
+   * @param $title title for the new page
+   * @param $fields assoc array of field name => value pairs to be set
+   */
+  public function createPage(Page $parent, $template, $title, $fields = array()) {
+    if (!is_object($parent) || ($parent instanceof NullPage)) {
+      $this->error("Error creating new {$template} named {$title} since its parent does not exists.");
+      return NULL;
+    }
+    // parent page needs to have an ID, get one by saving it
+    if (!$parent->id) $parent->save();
+    $p = $this->wire(new Page());
+    if (!is_object($p)) {
+      $this->error("Error creating new page named {$title} from {$template} template.");
+      return NULL;
+    }
+    $p->template = $template;
+    $p->parent = $parent;
+    $p->title = $title;
+    if (count($fields)) foreach ($fields as $field => $value) {
+      // if ($p->hasField($field)) $p->$field = $value;
+      $p->$field = $value;
+    }
+
+// TODO multi-language support for headwords?
+/*
+    $p->of(false); // turn of output formatting
+
+    //foreach ($this->languages as $lang) {
+    $langs = $p->getLanguages();
+    if (count($langs)) foreach ($p->getLanguages() as $lang) {
+      $p->title->setLanguageValue($lang, $title);
+    } else $p->title = $title;
+
+    if (count($fields)) foreach ($fields as $field => $value) {
+      // if ($p->hasField($field)) $p->$field = $value;
+      if (count($langs)) foreach ($p->getLanguages() as $lang) {
+        $p->{$field}->setLanguageValue($lang, $value);
+      } else $p->set($field, $value);
+    }
+*/
+
+    $this->message("{$parent->title} / {$title} [{$template}] created.", Notice::debug);
+    $p->save(); // pages must be saved to be a parent or to be referenced
+    return $p;
+  }
+
+
+
+
+/***********************************************************************
+ * PAGE JOB MANAGEMENT
+ **********************************************************************/
+
+  /**
+   * Find all job(set)s matching a filter
+   * 
+   * @param $page page object/PageArray/selector where to search for jobs
+   * @param $filter optional filter by command (see above)
+   * @param $preg_flags optional preg_grep flag like PREG_GREP_INVERT
+   * @returns array of pageId => array of job strings
+   */
+  public function findJobs($page='', string $filter='', $preg_flags=0) {
+    $jobsets = array();
+
+    // process a page selector
+    if (is_string($page)) {
+      $page = wire()->pages->find($page);
+    }
+    // process an array of pages
+    if ($page instanceof PageArray) {
+      foreach ($page as $p) {
+        // array merge handles pageIDs as numeric keys and renumbers them
+        // $jobs = array_merge($jobs, $this->findJobs($p, $filter, $preg_flags));
+        // merging using + is OK for simple arrays
+        $jobsets = $jobsets + $this->findJobs($p, $filter, $preg_flags);
+      }
+      return $jobsets;
+    } else if ($page instanceof Page) {
+      if (!$page->hasField($this->jobfield)) return array();
+      // TODO better search
+      // remove the job description from the filter
+      require_once __DIR__.'/DictionaryJob.php';
+      $filter = explode(DictionaryJob::JOB_DESC_SEP, $filter)[0];
+      return array(
+        $page->id => DictionaryJob::jobSet2Array(
+            DictionaryJob::filterJobs($filter, $page->{$this->jobfield}, $preg_flags)
+          )
+        );
+    } else return array();
+  }
+
+
+/***********************************************************************
+ * DISPLAY FUNCTIONS
+ **********************************************************************/
+
+  /**
+   * Display a navigation tree for dictionary based on initial letters
+   * 
+   * @param $dicPage dictionary page object
+   * @param $pattern array initial letters for the tree or string to prepend to letters in the default array
+   * @param $liClass additional attributes for <li> tags. If null <li> is omitted.
+   * @param $aClass additional attributes for <a> tags. If null <a> is omitted.
+   * @param $countHeadwords count the headwords matching the pattern (also skips empty sets)
+   * @returns html string to output
+   */
+  public function renderLetterNav($dictPage, $pattern, $liClass=' class="nav-item"', $aClass=' class="nav-link"', $countHeadwords = false) {
+    $out = '';
+    if (is_array($pattern)) {
+      $letters = $pattern;
+    } else {
+      $letters = $this->dictInitialLetters;
+      // sanitizing pattern ($sanitizer->selectorValue() would not work well)
+      if (mb_strlen($pattern)) $pattern = str_replace('"', '', $pattern);
+    }
+    foreach ($letters as $u => $t) {
+      if (!is_null($liClass)) $out .= "<li$liClass>";
+      if (is_null($aClass)) {
+        $out .= $t;
+      } else if (is_string($pattern) && mb_strlen($pattern)) {
+        $url = urlencode($pattern.$u);
+        $text = $pattern.$u;
+        $selector = $pattern.$u;
+      } else {
+        $url = urlencode($u);
+        $text = $t;
+        $selector = $u;
+      }
+      if ($countHeadwords) {
+        $count = $this->pages->count('parent='.$dictPage.',title^="'.$selector.'"');
+        if ($count == 0) continue;
+        $text .= " ($count)";
+      }
+      $out .= "<a href='{$dictPage->url}?w={$url}'{$aClass}>{$text}</a>";
+      if (!is_null($liClass)) $out .= '</li>';
+      $out .= "\n";
+    }
+    return $out;
+  }
+
+  /**
+   * Display a navigation tree for dictionary items
+   * 
+   * @param $dicPage dictionary page object
+   * @param $letters array initial letters for the tree
+   * @param $liClass additional attributes for <li> tags. If null <li> is omitted.
+   * @param $aClass additional attributes for <a> tags. If null <a> is omitted.
+   * @returns html string to output
+   */
+  public function renderNav($dictPage, $selector='', $liClass=' class="nav-item"', $aClass=' class="nav-link"') {
+    $out = '';
+    $headwords = $dictPage->children($selector);
+    foreach ($headwords as $headword) {
+      if (!is_null($liClass)) $out .= "<li$liClass>";
+      if (is_null($aClass)) {
+        $out .= $t;
+      } else {
+        $out .= "<a href='{$headword->url}'{$aClass}>{$headword->title}</a>";
+      }
+      if (!is_null($liClass)) $out .= '</li>';
+      $out .= "\n";
+    }
+    return $out;
+  }
+
+  /**
+   * Display a navigation tree for dictionary items
+   * 
+   * @param $dicPage dictionary page object
+   * @param $letters array initial letters for the tree
+   * @param $liClass additional attributes for <li> tags. If null <li> is omitted.
+   * @param $aClass additional attributes for <a> tags. If null <a> is omitted.
+   * @returns html string to output
+   */
+  public function renderHeadwords($dictPage, $selector='', $liClass=' class="nav-item"', $aClass=' class="nav-link"') {
+    $out = '';
+    if (!strlen($selector)) {
+      $selector = 'limit=30,sort=random';
+    }
+    $headwords = $dictPage->children($selector);
+    foreach ($headwords as $headword) {
+      if (!is_null($liClass)) $out .= "<li$liClass>";
+      if (is_null($aClass)) {
+        $out .= $t;
+      } else {
+        $out .= "<a href='{$headword->url}'{$aClass}>{$headword->title}</a>";
+      }
+      if (!is_null($liClass)) $out .= '</li>';
+      $out .= "\n";
+    }
+    return $out;
+  }
+
+/***********************************************************************
+ * LOGGING AND UTILITY METHODS
+ **********************************************************************/
+  /**
+   * Log a message to a page
+   * 
+   * @param $page reference to the page object
+   * @param $file filefield entry to process
+   * @param $startRecord XML element to start at
+   * @param $options import options
+   */
+  public function log(&$page, $text) {
+    // check if a system job field exists
+    if (!$page->hasField($this->logfield)) return;
+
+    $page->{$this->logfield} .= $text."\n";
+    $page->save($this->logfield);
+  }
+
+  /**
+   * Log and write an error message
+   * 
+   */
+  public function errorLog(Page &$page, string $text, int $flags = 0) {
+    $this->log($page, $text);
+    $this->error($text, $flags);
+  }
+
+
+  /**
+   * Log and write an error message
+   * 
+   */
+  public function messageLog(Page &$page, string $text, int $flags = 0) {
+    $this->log($page, $text);
+    $this->message($text, $flags);
+  }
+
+
+  /**
+   * Get notices
+   * 
+   * @return HTML-encoded list of system notices
+   */
+  public function getNotices() {
+    $ret = '<ul class="NoticeMessages">';
+    foreach($this->notices as $notice) {
+      $class = $notice->className();
+      $text = wire('sanitizer')->entities($notice->text);
+      $ret .= '<li class="'.$class.">$text</li>\n";
+      //$ret .= "<li>$text</li>\n";
+    }
+    $ret .= '</ul>';
+    return $ret;
+  }
+
+
+  /**
+   * Get custom output field for a given name
+   * 
+   * @param $cname canonical field name
+   */
+  public function getFieldName($cname) {
+    return (isset($this->fieldNames[$cname]) ? $this->fieldNames[$cname] : $cname);
+  }
+
+
+  /**
+   * Decompose an URI request
+   * 
+   * @param $request URI
+   */
+  public function getRequestFields($request) {
+    /*
+    $uripos = strpos($_SERVER['REQUEST_URI'], 'job');
+    if (false===$uripos) return $this->execute();
+    
+    $uriparts = explode('/', substr($_SERVER['REQUEST_URI'], $uripos));
+    if (count($uriparts) < 2) return $this->execute();
+    $jobEntry = array_pop($uriparts);
+    $dictPageId = array_pop($uriparts);
+    */
+
+    // match the module base URL + command + dictPageId + jobEntry + other arguments
+    $uriparts = parse_url($request);
+    
+    $command = $dictPageId = $jobEntry = '';
+    $num = sscanf($uriparts['path'], $this->adminUrl.'%[^/]/%d/%s',
+        $command, $dictPageId, $jobEntry);
+
+    if ($jobEntry!='') $jobEntry = urldecode($jobEntry);
+
+    $params = array();
+    if (isset($uriparts['query'])) {
+      parse_str($uriparts['query'], $query);
+      foreach ($query as $key => $value) $params[$key] = urldecode($value);
+    }
+
+//echo "$num, $command, $dictPageId, $jobEntry";
+//var_dump($params);
+
+    return array($num, $command, $dictPageId, $jobEntry, $params);
+  }
+
+  /**
+   * Read module options from the invoking page
+   * 
+   * @param $page source page where the options are defined.
+   * @returns array of options
+   */
+  public function getOptions($page) {
+    $options = self::DEF_OPTIONS;
+
+    // process options
+    if ($page->hasField($this->optionsfield)) foreach ($page->{$this->optionsfield} as $option) {
+      if (isset($options[$option->value])) {
+        $options[$option->value] = true;
+      }
+    }
+
+    // try to calculate a max_execution_time for long jobs
+    $options[self::OPT_MAX_TIME] = $this->getMaxExecTime();
+
+    // dump options to the debug channel
+    $this->printOptions($options);
+    return $options;
+  }
+
+  /**
+   * Dump options to the debug channel
+   * 
+   * @param $options array of options to print
+   */
+  public function printOptions($options) {
+    foreach($options as $option => $value) {
+      if ($value) $string = "set"; else $string = "not set";
+      $this->message("Option '".self::OPTIONS[$option]."' is {$string}", Notice::debug);
+    }
+  }
+
+  /**
+   * Calculate / check the script's max remaining execution time
+   * 
+   * @returns int the time before the script should stop, false if time expired, -1 if there's no time limit
+   */
+  public function getMaxExecTime($options = NULL) {
+    if (intval(ini_get('max_execution_time')) == 0) return -1; // no limit
+    if (is_array($options) && isset($options[self::OPT_MAX_TIME])
+        && ($options[self::OPT_MAX_TIME] > 0)
+        && ($options[self::OPT_MAX_TIME] <= time())) {
+      $timeDiff = $options[self::OPT_MAX_TIME] - time();
+      //wire()->message("Maximum execution time is over.", Notice::debug);
+      return false; // no more time left
+    } else {
+      $timeDiff = intval(ini_get('max_execution_time')) - self::MAX_EXEC_TIME_THRESHOLD;
+      wire()->message("Remaining execution time is {$timeDiff} sec.", Notice::debug);
+      return time() + $timeDiff;
+    }
+  }
+}

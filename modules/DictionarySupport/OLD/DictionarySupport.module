@@ -1,0 +1,917 @@
+<?php namespace ProcessWire;
+// DEBUG disable file compiler for this file
+// FileCompiler=0
+
+/**
+ * ProcessWire 'DictionarySupport' module
+ *
+ * The module provides support functions to import and display dictionaries.
+ *
+ */
+
+/**
+ * Abstract class Process extends WireData implements Module.
+ */
+class DictionarySupport extends Process implements Module {
+  /**
+   * Get information about this module
+   * 
+   */
+  public static function getModuleInfo() {
+    return array(
+      'title' => 'Dictionary support module',
+      'version' => 1,
+      'summary' => 'The module provides support functions to import and display dictionaries.',
+      'href' => 'https://processwire.com', // TODO link
+      'singular' => true, // contains hooks
+      'autoload' => true, // attaches to hooks
+      'icon' => 'link', // fontawesome icon
+      'page' => array( // we also create an admin page for this module
+        'name' => 'dict-manage',
+        'parent' => '/admin/page/',
+        'title' => 'Dictionary management',
+        'template' => 'admin'
+        ),
+    );
+  }
+
+  /**
+   * Options table name, version and elements
+   *
+   */
+  // options DB table name
+  const TABLE_NAME = 'dictionarysupport';
+  // DB schema version, increase if new options are added
+  const SCHEMA_VERSION = 1;
+  // these options present in the DB and can be altered on a page
+  const OPT_DRYRUN = 1; // do not do anything just pretend
+  const OPT_PURGE = 2; // purge the dictionary before executing a job
+  // these are hidden option IDs
+  const OPT_HIDDEN = 20; // start ID for hidden options
+  const OPT_SKIP = 21; // skip the specified number of records
+  const OPT_MAX_TIME = 22; // max execution time
+  // options that go into the database
+  const OPTIONS = array(
+    self::OPT_DRYRUN  => 'Do not actually import/update/delete anything',
+    self::OPT_PURGE  => 'Purge the dictionary before import',
+    self::OPT_SKIP  => 'Skip some records while processing a dictionary',
+    self::OPT_MAX_TIME  => 'Maximum execution time',
+  );
+  // default options
+  const DEF_OPTIONS = array(
+    self::OPT_DRYRUN => false,
+    self::OPT_PURGE  => false,
+  );
+  // input XML tag names
+  private $tagNames;
+  // output field names
+  private $fieldNames;
+  // redirect URL after page save
+  private $redirectUrl='';
+  // time threshold before the max_execution_time [sec]
+  const MAX_EXEC_TIME_THRESHOLD = 50; // TODO lower to 10
+  // max execution time for async requests [sec]
+  const MAX_ASYNC_EXEC_TIME = 20; // seconds
+  // file tags
+  const TAG_IMPORT='import';
+  const TAG_UPDATE='update';
+  const TAG_DELETE='delete';
+  
+
+/***********************************************************************
+ * MODULE SETUP
+ **********************************************************************/
+
+  /**
+   * Called only when this module is installed
+   * 
+   * Creates new custom database table for storing import configuration data.
+   */
+  public function ___install() {
+    parent::___install(); // creates the admin page
+    // create and populate the configuration options table in the database
+    // this table is used by the "Select external option" fieldtype
+    $sql = 'CREATE TABLE '.self::TABLE_NAME." (
+            option_key INT UNSIGNED NOT NULL DEFAULT 0,
+            option_value TEXT DEFAULT NULL,
+            comment TEXT DEFAULT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+        INSERT INTO ".self::TABLE_NAME." (option_key, option_value) VALUES ";
+    foreach (self::OPTIONS as $key => $value) {
+      if ($key >= self::OPT_HIDDEN) break; // do not process hidden options
+      $sql .= "($key, '$value'), ";
+    }
+    $sql = rtrim($sql, ', ');
+    $this->message('Creating database table '.self::TABLE_NAME.'.', Notice::debug);
+//    $this->message($sql, Notice::debug);
+    $this->database->exec($sql);
+  }
+
+
+  /**
+   * Called only when this module is uninstalled
+   * 
+   * Drops database table created during installation.
+   */
+  public function ___uninstall() {
+    parent::___uninstall(); // deletes the admin page
+    $this->message('Deleting database table '.self::TABLE_NAME);
+    $this->database->exec('DROP TABLE IF EXISTS '.self::TABLE_NAME);
+  }
+
+
+  /**
+   * Initialization
+   * 
+   * This function attaches a hook for page save and decodes module options.
+   */
+  public function init() {
+    parent::init();
+    
+    // handle REST (AJAX) requests
+    // TODO does not work with certain proxy setups
+    $apiUrl = ltrim(wire('config')->urls->admin.'page/dict-manage/api', '/');
+    if (strpos($this->input->get->it, $apiUrl)!==false) {
+      // TODO check permissions
+      $this->processHttpRequest();
+      exit; // do not output anything else
+    }
+
+    // process module's configuration: XML tag name mappings
+    $this->tagNames = json_decode(trim($this->tagmappings), true);
+    if (!is_array($this->tagNames)) {
+      $this->error("Invalid XML name mappings. Check the module's configuration.");
+      return;
+    }
+/* field mappings are disabled atm
+    // process module's configuration: field name mappings
+    $this->fieldNames = json_decode(trim($this->fieldmappings), true);
+    if (!is_array($this->fieldNames)) {
+      $this->error("Invalid field name mappings. Check the module's configuration.");
+      return;
+    }
+*/
+    // check requirements
+    if (!$this->modules->isInstalled("FieldtypeSelectExtOption")
+        || !class_exists('XMLReader')) {
+      return;
+    }
+
+    // install a conditional hook after page save to import dictionary entries
+    // TODO this conditional hook would be better but it does not work:
+    //   'Pages(template='.$this->dictionary_template.')::saveReady'
+    $this->pages->addHookAfter('Pages::saveReady', $this, 'importDictionary');
+  }
+
+
+/***********************************************************************
+ * MODULE FUNCTIONS
+ **********************************************************************/
+
+  /**
+   * Hook that creates a dictionary job to process the input files
+   */
+  public function importDictionary(HookEvent $event) {
+    $page = $event->arguments[0];
+    // check the template
+    // TODO would be better not to call the hook at all
+    if ($page->template != $this->dictionary_template) return;
+    
+    // create a dictionary from the page using this module as an environment
+    require_once __DIR__.'/Dictionary.php';
+    $dict = new Dictionary($page, $this);
+
+    // check if any job is active for this page
+    if ($dict->hasJob()) {
+      wire()->warning('Skipping creating new import job since pending jobs found for this dictionary. '
+        .'Please visit the <a href="'.wire('config')->urls->admin.'page/dict-manage/'
+        .'">Dictionary Admin Page</a> for more details.', Notice::allowMarkup);
+      return;
+    }
+
+    // constructing dictionary jobs
+    // (these are long running progs so we can't execute them right now)
+    // import the dictionary from its source specified on the page
+    // $dict->import();
+    require_once __DIR__.'/DictionaryJob.php';
+
+    $options = $this->getOptions($page);
+
+    if ($options[DictionarySupport::OPT_PURGE]) { // purge is required before import
+      $jobEntry = DictionaryJob::constructJobEntry(DictionaryJob::CMD_PURGE, '', 'Purge the dictionary.');
+      $dict->addJob($jobEntry, false);
+    }
+
+    $jobEntry = DictionaryJob::constructJobEntry(DictionaryJob::CMD_PROCESS_ALL, '', 'Process data from all input files.');
+    $dict->addJob($jobEntry, false);
+
+    $job = DictionaryJob::deconstructJobEntry($jobEntry)[DictionaryJob::JOB_IDX_JOB];
+    // set up a redirect url
+    $this->redirectUrl = wire('config')->urls->admin.'page/dict-manage?d='.$page->id.'&j='.urlencode($job).'&x';
+    $this->message("Redirecting to the directory admin page: {$this->redirectUrl}", Notice::debug);
+
+    // add a hook to redirect to the directory admin page after editing the current page
+    $this->pages->addHookBefore('ProcessPageEdit::processSaveRedirect', $this, 'processDictionaryJobs');
+  }
+
+
+  /**
+   * Hook that redirects the user to the dict admin page
+   */
+  public function processDictionaryJobs(HookEvent $event) {
+    // set up a redirect if we've created a job on page save
+    if ($this->redirectUrl != '') {
+      $event->arguments = array($this->redirectUrl);
+      $this->redirectUrl = '';
+    }
+    // remove this hook
+    $event->removeHook(null);
+  }
+
+
+  /**
+   * Public API functions over HTTP
+   * Currently it only supports job execution, first matching job in the specified dict
+   * TODO query job progress, max job size etc.
+   */
+  public function processHttpRequests() {
+    // response object (will be encoded in JSON form)
+    $ret = array(
+      'status'=> false,
+      'result' => '',
+      'value' => 0,
+      'log' => '',
+      'debug' => $this->config->debug
+      );
+
+    if (!isset(wire()->input->get->d)
+        || !isset(wire()->input->get->j)) {
+      $ret['result'] = 'Invalid API request,';
+      $ret['log'] = $this->getNotices();
+      echo json_encode($ret);
+      exit;
+    }
+
+    // select the first matching dictionary
+    $dictPage = $this->pages->findOne('id='.wire()->input->get->d.',template='.$this->dictionary_template);
+    if ($dictPage instanceof NullPage) {
+      $ret['result'] = 'No matching dictionary found.';
+      $ret['log'] = $this->getNotices();
+      echo json_encode($ret);
+      exit;
+    }
+
+    // construct a dictionary object
+    require_once __DIR__.'/Dictionary.php';
+    $dict = new Dictionary($dictPage, $this);
+
+    // select the job
+    $jobEntry = wire()->input->get->j;
+    if ($dict->hasJob($jobEntry, 0)) {
+      $job = new DictionaryJob($dict, $jobEntry);
+    } else {  // try to find a match
+      list ($job, $command, $arguments, $description) = DictionaryJob::deconstructJobEntry($jobEntry);
+      if ($dict->hasJob($command, 0)) { // match by command name
+        $job = new DictionaryJob($dict, $command);
+      } else if ($command == DictionaryJob::CMD_PROCESS_ALL) {
+        // when process all is finished it is broken down into process file jobs
+        // get the first process file job
+        $jobEntry = DictionaryJob::CMD_PROCESS_FILE;
+        if (count($jobs = $dict->findJobs($jobEntry, 0))) {
+          $jobEntry = $jobs[0];
+//echo "JOB $jobEntry found as $command ( $arguments ).\n";
+          $job = new DictionaryJob($dict, $jobEntry); // select the first matching job
+        } else { // no luck finding the proper job
+          $ret['result'] = 'Job not found: '.$jobEntry;
+          $ret['log'] = $this->getNotices();
+          echo json_encode($ret);
+          exit;
+        }
+      }
+    }
+
+    // $job->printDebugInfo();
+
+    // calculate and return an estimation if requested
+    if (isset(wire()->input->get->est)) {
+      if (false===($res = $job->estimate())) {
+        $ret['result'] = 'Job estimation failed.';
+        $ret['log'] = $this->getNotices();
+        echo json_encode($ret);
+      } else {
+        $ret['log'] = $this->getNotices();
+        $ret['status'] = true;
+        $ret['value'] = $res;
+        echo json_encode($ret);
+      }
+      exit;
+    }
+
+    // use a short execution time to present results to the user more often
+    $job->setOption(self::OPT_MAX_TIME, time() + self::MAX_ASYNC_EXEC_TIME);
+
+    // execute the job and get the results
+    $res = $job->execute();
+    if ($res === false) {
+      $ret['result'] = 'Job execution failed.';
+      $ret['log'] = $this->getNotices();
+      echo json_encode($ret);
+      exit;
+    }
+    // and return the number of processed records
+    $ret['result'] = $res;
+    $ret['value'] = $job->getNumberOfProcessedRecords();
+    $ret['log'] = $this->getNotices();
+    $ret['status'] = true;
+    echo json_encode($ret);
+    exit;
+  }
+
+  /**
+   * Execute function for the admin menu interface
+   * 
+   */
+  public function execute() {
+    if (isset(wire()->input->get->api)) {
+      $this->processHttpRequests();
+      exit;
+    }
+
+    // check and process input arguments
+    // dictionary id is given
+    if (isset(wire()->input->get->d)) {
+      $dicts = $this->pages->find('id='.wire()->input->get->d.',template='.$this->dictionary_template);
+    } else {
+      $dicts = $this->pages->find('template='.$this->dictionary_template);
+    }
+    // job command is given
+    if (isset(wire()->input->get->j)) {
+      $jobsets = $this->findJobs($dicts, urldecode(wire()->input->get->j));
+    } else {
+      $jobsets = $this->findJobs($dicts);
+    }
+
+    // execute a given job on a given page in the background using javascript HTTP calls
+    // TODO execute multiple jobs
+    if (isset(wire()->input->get->b)
+        && count($dicts)>0 && is_array($jobsets[$dicts->first()->id])
+        && isset($jobsets[$dicts->first()->id][0])) {
+
+      // turn off debugging since this thread is only the frame for executing jobs via javascript
+      $this->config->debug = false;
+
+      require_once __DIR__.'/Dictionary.php';
+      $dict = new Dictionary($dicts->first(), $this);
+      // execute the first job for the first page
+      require_once __DIR__.'/DictionaryJob.php';
+      $job = new DictionaryJob($dict, $jobsets[$dicts->first()->id][0]);
+      $out = '<h2>Executing job: '.$job->description.'</h2>';
+      // setting up a div field for javascript output
+      $out .= '
+<div id="jobprogress"><div class="progress-label"></div></div>
+<div id="joblog">Javascript is not enabled. Background jobs will not execute.
+</div>';
+      return $out;
+      // the rest will be done by Javascript functions
+    }
+
+    // execute a given job on a given page in the foreground
+    // TODO execute multiple jobs
+    if (isset(wire()->input->get->x)
+        && count($jobsets)==1
+        && count($dicts)==1 && is_array($jobsets[$dicts->first()->id])) {
+
+      require_once __DIR__.'/Dictionary.php';
+      $dict = new Dictionary($dicts->first(), $this);
+      // execute the first job for the first page
+      require_once __DIR__.'/DictionaryJob.php';
+      $job = new DictionaryJob($dict, $jobsets[$dicts->first()->id][0]);
+      $out = '<h2>Estimating job '.$job->description.'</h2>';
+      // estimate the length of the job
+      //$out .= $job->estimate();
+      // TODO try to calculate a max_execution_time after job estimation
+      // $this->options[self::OPT_MAX_TIME] = $this->getMaxExecTime()-$timeSpent;
+
+      $out = '<h2>Executing job '.$job->description.'</h2>';
+      $out .= $job->execute();
+      $jobsets = $this->findJobs($dicts);
+    }
+
+    $out = "<h2>Dictionary Admin page</h2>\n";
+    $out .= '<h3>Dictionaries</h3><p>';
+    foreach ($dicts as $dict) {
+      $out .= '<a href="'.$dict->url.'">'.$dict->title.'</a>';
+      $out .= ' ('.count($dict->children('template='.$this->headword_template))." headwords), ";
+      if ($dict->editable()) {
+        $out .= ' [<a href="'.$dict->editUrl().'">Edit</a>]';
+      }
+    }
+    $out .= "</p>\n";
+
+
+    $out .= '<h3>Pending jobs</h3><p>';
+    foreach ($jobsets as $pageId => $pageJobs) foreach ($pageJobs as $jobEntry) {
+      if (!strlen(trim($jobEntry))) continue;
+      list ($job, $command, $arguments, $description) = DictionaryJob::deconstructJobEntry($jobEntry);
+      if ($command === DictionaryJob::CMD_DONE) continue; // skip finished jobs
+      $out .= $this->pages->get($pageId)->title.': '.$description;
+      $out .= ' [<a href="'.$this->url.'?j='.urlencode($job).'&d='.$pageId.'&x">Execute in the foreground</a>] '; // TODO check permission
+      // TODO this is a hack: always process the first job matching the command
+      $out .= ' [<a href="'.$this->url.'?j='.$command.'&d='.$pageId.'&b" target="_blank">Execute in the background</a>]<br />'; // TODO check permission
+    }
+    $out .= "</p>\n";
+
+    $out .= '<p><a href="'.$this->page->url.'">Refresh this page.</a></p>';
+    return $out;
+  }
+
+
+/***********************************************************************
+ * CONTENT MANAGEMENT
+ **********************************************************************/
+  /**
+   * Create and save a new Processwire Page and set its fields.
+   * 
+   * @param $parent the parent node reference
+   * @param $template the template of the new page
+   * @param $title title for the new page
+   */
+  public function createPage(Page $parent, $template, $title, $name='') {
+    if (!is_object($parent) || ($parent instanceof NullPage)) {
+      $this->error("Error creating new {$template} named {$title} since its parent does not exists.");
+      return NULL;
+    }
+    // parent page needs to have an ID, get one by saving it
+    if (!$parent->id) $parent->save();
+    $p = $this->wire(new Page());
+    if (!is_object($p)) {
+      $this->error("Error creating new page named {$title} from {$template} template.");
+      return NULL;
+    }
+    $p->template = $template;
+    $p->parent = $parent;
+    $p->title = $title;
+    if (strlen($name)) $p->name = $name;
+    //$p->of(false); // do not cache the page
+    $p->save(); // pages must be saved to be a parent or to be referenced
+//    $this->message("{$parent->title} / {$title} [{$template}] created.", Notice::debug);
+    return $p;
+  }
+
+
+
+
+/***********************************************************************
+ * PAGE JOB MANAGEMENT
+ **********************************************************************/
+
+  /**
+   * Find all job(set)s matching a filter
+   * 
+   * @param $page page object/PageArray/selector where to search for jobs
+   * @param $filter optional filter by command (see above)
+   * @param $preg_flags optional preg_grep flag like PREG_GREP_INVERT
+   * @returns array of pageId => array of job strings
+   */
+  public function findJobs($page='', string $filter='', $preg_flags=0) {
+    $jobsets = array();
+
+    // process a page selector
+    if (is_string($page)) {
+      $page = wire()->pages->find($page);
+    }
+    // process an array of pages
+    if ($page instanceof PageArray) {
+      foreach ($page as $p) {
+        // array merge handles pageIDs as numeric keys and renumbers them
+        // $jobs = array_merge($jobs, $this->findJobs($p, $filter, $preg_flags));
+        // merging using + is OK for simple arrays
+        $jobsets = $jobsets + $this->findJobs($p, $filter, $preg_flags);
+      }
+      return $jobsets;
+    } else if ($page instanceof Page) {
+      if (!$page->hasField($this->jobfield)) return array();
+      // TODO better search
+      // remove the job description from the filter
+      require_once __DIR__.'/DictionaryJob.php';
+      $filter = explode(DictionaryJob::JOB_DESC_SEP, $filter)[0];
+      return array(
+        $page->id => DictionaryJob::jobSet2Array(
+            DictionaryJob::filterJobs($filter, $page->{$this->jobfield}, $preg_flags)
+          )
+        );
+    } else return array();
+  }
+
+
+/***********************************************************************
+ * LOGGING AND UTILITY METHODS
+ **********************************************************************/
+  /**
+   * Log a message to a page
+   * 
+   * @param $page reference to the page object
+   * @param $file filefield entry to process
+   * @param $startRecord XML element to start at
+   * @param $options import options
+   */
+  public function log(&$page, $text) {
+    // check if a system job field exists
+    if (!$page->hasField($this->logfield)) return;
+
+    $page->{$this->logfield} .= $text."\n";
+    $page->save($this->logfield);
+  }
+
+  /**
+   * Log and write an error message
+   * 
+   */
+  public function errorLog(Page &$page, string $text, int $flags = 0) {
+    $this->log($page, $text);
+    $this->error($text, $flags);
+  }
+
+
+  /**
+   * Log and write an error message
+   * 
+   */
+  public function messageLog(Page &$page, string $text, int $flags = 0) {
+    $this->log($page, $text);
+    $this->message($text, $flags);
+  }
+
+
+  /**
+   * Get notices
+   * 
+   * @return HTML-encoded list of system notices
+   */
+  public function getNotices() {
+    $ret = '<ul class="NoticeMessages">';
+    foreach($this->notices as $notice) {
+      $class = $notice->className();
+      $text = wire('sanitizer')->entities($notice->text);
+      $ret .= '<li class="'.$class.">$text</li>\n";
+      //$ret .= "<li>$text</li>\n";
+    }
+    $ret .= '</ul>';
+    return $ret;
+  }
+
+  /**
+   * Get custom input XML tagname for $tagname
+   * 
+   * @param $cname canonical input name
+   */
+  public function getTagName($cname) {
+    return (isset($this->tagNames[$cname]) ? $this->tagNames[$cname] : $cname);
+  }
+
+
+  /**
+   * Get custom output field for a given name
+   * 
+   * @param $cname canonical field name
+   */
+  public function getFieldName($cname) {
+    return (isset($this->fieldNames[$cname]) ? $this->fieldNames[$cname] : $cname);
+  }
+
+
+  /**
+   * Read module options from the invoking page
+   * 
+   * @param $page source page where the options are defined.
+   * @returns array of options
+   */
+  public function getOptions($page) {
+    $options = self::DEF_OPTIONS;
+
+    // process options
+    if ($page->hasField($this->optionsfield)) foreach ($page->{$this->optionsfield} as $option) {
+      if (isset($options[$option->value])) {
+        $options[$option->value] = true;
+      }
+    }
+
+    // try to calculate a max_execution_time for long jobs
+    $options[self::OPT_MAX_TIME] = $this->getMaxExecTime();
+
+    // dump options to the debug channel
+    $this->printOptions($options);
+    return $options;
+  }
+
+  /**
+   * Dump options to the debug channel
+   * 
+   * @param $options array of options to print
+   */
+  public function printOptions($options) {
+    foreach($options as $option => $value) {
+      if ($value) $string = "set"; else $string = "not set";
+      $this->message("Option '".self::OPTIONS[$option]."' is {$string}", Notice::debug);
+    }
+  }
+
+  /**
+   * Calculate / check the script's max remaining execution time
+   * 
+   * @returns int the time before the script should stop, false if time expired, -1 if there's no time limit
+   */
+  public function getMaxExecTime($options = NULL) {
+    if (intval(ini_get('max_execution_time')) == 0) return -1; // no limit
+    if (is_array($options) && isset($options[self::OPT_MAX_TIME])
+        && ($options[self::OPT_MAX_TIME] > 0)
+        && ($options[self::OPT_MAX_TIME] <= time())) {
+      $timeDiff = $options[self::OPT_MAX_TIME] - time();
+      wire()->message("Maximum execution time is over.", Notice::debug);
+      return false; // no more time left
+    } else {
+      $timeDiff = intval(ini_get('max_execution_time')) - self::MAX_EXEC_TIME_THRESHOLD;
+      wire()->message("Remaining execution time is {$timeDiff} sec.", Notice::debug);
+      return time() + $timeDiff;
+    }
+  }
+
+
+/***********************************************************************
+ * OLD METHOD VERSIONS
+ **********************************************************************/
+  /**
+   * Import data from the XML string and add/update child nodes @$page
+   * 
+   * @param $page reference to the page object
+   * @param $xml PHP:XMLReader object pointing to the current headword
+   * @param int
+   */
+  public function importEntry_OLD(&$page, &$xml, $options) {
+    $headword = $xml->getAttribute('headword');
+
+    // string cleanup
+    $headword = str_replace(array(',', ' '), array('_', '_'), $headword);
+    $title = str_replace('_', ' ', $headword);
+
+    // check the headword page
+    $hwp=$page->child('title="'.$title.'", template='.$this->headword_template.", include=all");
+
+/**********************************************************************/
+    if (class_exists('\Zarganwar\PerformancePanel\Register')) {
+      \Zarganwar\PerformancePanel\Register::add('dict_get_children_'.$title);
+    }
+/**********************************************************************/
+
+    // TODO update is not working atm
+    $options[self::OPT_UPDATE] = false;
+
+    if ($hwp->id) { // headword already exists
+      if (!$options[self::OPT_UPDATE]) {
+        $this->message("Ignoring already existing headword {$headword}.");
+        return NULL;
+      }
+      // fix and set the node title
+      $hwp->title = str_replace('_', ' ', $headword);
+
+      $this->message("Updating child node {$headword}.", Notice::debug);
+    } else { // create a new headword child node
+      $hwp = $this->createPage($page, $this->headword_template, $title);
+      $hwp->save(); // must be saved before adding children
+    }
+
+    // import XML data into the child node
+    if (!$this->importXML($xml, $hwp)) {
+      $this->error("Import failed for {$headword}.");
+      $hwp->delete(true);
+      return NULL;
+    }
+
+    // save the headword page after all child nodes are processed
+    $hwp->save();
+
+    // return the child's title
+    return $headword;
+  }
+
+
+  /**
+   * Import an XML entry record / OLD version
+   * 
+   * @param $xml XML input stream
+   * @param $hwp headword page
+   * @returns true on success, false on error
+   */
+  private function importXML_OLD(&$xml, &$hwp) {
+
+    $return = true; // default optimistic return status
+
+/**********************************************************************/
+    if (class_exists('\Zarganwar\PerformancePanel\Register')) {
+      \Zarganwar\PerformancePanel\Register::add('dict_reading_'.$hwp->title);
+    }
+/**********************************************************************/
+
+    while ($xml->read()) {
+      // process elements
+      if ($xml->nodeType == \XMLReader::ELEMENT) {
+        switch($xml->localName) {
+        case 'entry': // this is an error
+        case $this->getTagName('headword'): // this is also an error
+          return false;
+        case $this->getTagName('related'):
+          $hwp->{$this->getFieldName('related')} = $xml->readString();
+          break;
+        case $this->getTagName('comment'):
+          $hwp->{$this->getFieldName('comment')} = $xml->readString();
+          break;
+        case $this->getTagName('meaning'):
+          $hwp->{$this->getFieldName('meaning')} = $xml->readString();
+          break;
+        case $this->getTagName('variant'):
+          $varip = $this->createPage($hwp, $this->variant_template, $xml->readString());
+          if (!is_object($varip)) {
+            $this->error("Error creating new headword variant {$xml->readString()}.");
+            $return = false;
+          }
+          $hwp->variants->add($varip);
+/**********************************************************************/
+          if (class_exists('\Zarganwar\PerformancePanel\Register')) {
+            \Zarganwar\PerformancePanel\Register::add('dict_next_variant', 'dict_reading_'.$hwp->title);
+          }
+/**********************************************************************/
+          break;
+        case $this->getTagName('wordform'):
+          if (!is_object($varip)) {
+            $this->error("Error creating new wordform {$xml->readString()} as its headword variant is not set.");
+            $return = false;
+            break;
+          }
+          // save the parent (if it's not already saved) before adding children
+          if (!$varip->id) $varip->save();
+          // create a new wordform page
+          $wordformp = $this->createPage($varip, $this->wordform_template, $xml->readString());
+          if (!is_object($wordformp)) {
+            $this->error("Error creating new wordform {$xml->readString()}.");
+            $return = false;
+          }
+          $varip->wordforms->add($wordformp);
+/**********************************************************************/
+          if (class_exists('\Zarganwar\PerformancePanel\Register')) {
+            \Zarganwar\PerformancePanel\Register::add('dict_next_wordform', 'dict_reading_'.$hwp->title);
+          }
+/**********************************************************************/
+          break;
+        }
+        continue; // continue with the next xml->read()
+      }
+
+      // process the end element
+      if ($xml->nodeType == \XMLReader::END_ELEMENT) {
+        switch($xml->localName) {
+        case $this->getTagName('entry'):
+/**********************************************************************/
+          if (class_exists('\Zarganwar\PerformancePanel\Register')) {
+            \Zarganwar\PerformancePanel\Register::add('dict_done_'.$xml->localName, 'dict_reading_'.$hwp->title);
+          }
+/**********************************************************************/
+          return $true; // finished processing the entry
+        case $this->getTagName('variant'):
+          // save the wordforms field of the headword variant
+          $varip->save($this->getFieldName('wordforms'));
+          unset($varip);
+          break;
+        case $this->getTagName('wordform'):
+          // save the wordform_examples field of the wordform
+          // TODO $wordform->save($this->getFieldName('wordform_examples'));
+          // unset($wordform);
+          break;
+        } // switch
+        continue; // continue with the next xml->read()
+      }
+
+    } // while xml->read
+
+    // we should not reach this point if everything went good
+    $this->error("Error processing {$hwp->title}.");
+    return false;
+}
+
+  /**
+   * Import a headword / OLD version
+   * This version was based on repeaters that don't really work when nested.
+   * 
+   * @param XML input stream
+   */
+  private function import_headword_OLD(&$xml, &$hwp) {
+    
+    $headwordFormTag = $this->getTagName('headword_form');
+    $headwordFormField = $this->getFieldName('headword_form');
+    $wordFormTag = $this->getTagName('wordform');
+    $wordFormField = $this->getFieldName('wordform');
+    
+    if (is_null($hwp)) {
+      $this->error("BUG: NULL headword???");
+      return false;
+    }
+    $return = true; // default return status
+
+    while ($xml->read()) {
+      if (($xml->localName == $this->getTagName('entry'))
+         && ($xml->nodeType == \XMLReader::END_ELEMENT))
+        break;  // finished processing the headword
+
+      // skip to the next element
+      if ($xml->nodeType != \XMLReader::ELEMENT) continue;
+      
+      // import content from singleton text nodes
+      foreach (array('related', 'comment', 'meaning') as $tag) {
+        if ($xml->localName == $this->getTagName($tag)) {
+          $hwp->{$this->getFieldName($tag)} = $xml->readString();
+        }
+      }
+
+      // find headword_forms, wordforms and examples
+      switch($xml->localName) {
+      case $headwordFormTag:
+        // get a new item from the headword_form repeater
+        $headwordFormRepeater = $headwordFormField.'s';
+        $this->message("newHeadwordForm", Notice::debug);
+        $newHeadwordForm = $hwp->{$headwordFormRepeater}->getNew();
+        if (!is_object($newHeadwordForm)) {
+          $this->error("Error creating new headword form.");
+          return false;
+        }
+        // store the text content
+        $headwordFormValue = $xml->readString();
+        $newHeadwordForm->$headwordFormField = $headwordFormValue;
+        // save the item to the repeater
+        $this->message("newHeadwordForm->save();", Notice::debug);
+        $newHeadwordForm->save();
+        $this->message("Stored {$headwordFormValue} in field {$headwordFormField} on page {$hwp->title}.", Notice::debug);
+        break;
+      case $wordFormTag:
+        if (is_null($newHeadwordForm)) {
+          $this->error("Skipping wordform {$xml->readString} as it has no associated headword_form.");
+          continue;
+        }
+        $wordFormRepeater = $wordFormField.'s';
+        if (is_null($newHeadwordForm->$wordFormRepeater)) {
+          $this->message("BUG: empty wordform repeater.");
+          return false;
+        }
+
+        //\TD::barDump($newHeadwordForm->{$wordFormRepeater});
+
+        // create a new word form item
+        $this->message("newWordForm", Notice::debug);
+        $newWordForm = $newHeadwordForm->{$wordFormRepeater}->getNew();
+        // store the new word form
+        $this->message("wordFormValue", Notice::debug);
+        $wordFormValue = $xml->readString();
+        $newWordForm->$wordFormField = $wordFormValue;
+        // save the new item
+        $this->message("newWordForm->save()", Notice::debug);
+        $newWordForm->save();
+        // add the headword form to the headword
+        try {
+          $this->message("add(newHeadwordForm)", Notice::debug);
+          $hwp->{$headwordFormRepeater}->add($newHeadwordForm);
+        } catch(WireException $e) {
+          $this->message("BUG failed to store {$wordFormValue} in field {$wordFormField}.", Notice::debug);
+          $return = false;
+          continue;
+        }
+        $this->message("wp->save()", Notice::debug);
+        $hwp->save(); // the page must be saved at this point
+        $this->message("Storing {$wordFormValue} in field {$wordFormField}.", Notice::debug);
+
+//        $where = "{$headwordFormField}={$headwordFormValue},{$wordFormField}={$wordFormValue}";
+//        $check = wire()->pages->find($where);
+/*
+        if ($headwordFormValue == '') { // the actual headword form
+          $this->error("Skipping wordform {$xml->readString} as it has no associated headword_form.");
+        } else {
+          if (is_null($hwp->{$headwordFormField.'s'}->get($headwordFormValue))) {
+            $this->error("BUG: {$headwordFormValue} headword not found.");
+            $this->error("DEBUG keys: ".implode(',',$hwp->{$headwordFormField.'s'}->getKeys()));
+            $this->error("DEBUG values: ".implode(',',$hwp->{$headwordFormField.'s'}->getValues()));
+            return false;
+          }
+          $newWordForm = $hwp->{$headwordFormField.'s'}->get($headwordFormValue)->getNew();
+          $wordFormValue = $xml->readString();
+          $newWordForm->$wordFormField = $wordFormValue;
+          $newWordForm->save();
+          $hwp->{$headwordFormField.'s'}[$newHeadwordForm]->add($newWordForm);
+          $this->message("Storing {$wordFormValue} in field {$wordFormField}.", Notice::debug);
+          $return = true;
+        }
+*/
+        break;
+      }
+    } // while xml->read
+
+    return $return;
+}
+
+}
